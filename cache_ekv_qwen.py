@@ -70,24 +70,24 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         else:
             current_pos = input_pos
             
-        # Compute average historical attention
-        numerator = self.attn_history_num.sum(dim=-1).float()
-        denominator = self.attn_history_denom.clamp(1, self.history_window_size)
+        # Compute average historical attention - sum across the correct dimension
+        numerator = self.attn_history_num.sum(dim=0).float()  # Changed from dim=-1 to dim=0
+        denominator = self.attn_history_denom.sum(dim=0).clamp(1, self.history_window_size)  # Added sum(dim=0)
         avg_attn = numerator / denominator
         
         # Apply head sharing factor to account for Qwen's architecture
         avg_attn = avg_attn * self.head_sharing_factor
         
+        # Create a broadcast-compatible mask for all heads
+        mask = torch.zeros_like(self.pos)
+        
         # Protect global and recent tokens
-        avg_attn.masked_fill_(
-            self.pos < self.global_tokens,
-            float('inf'),
-        )
-        avg_attn.masked_fill_(
-            self.pos >= current_pos - self.recent_window,
-            float('inf'),
-        )
-        avg_attn.masked_fill_(self.pos == -1, 0.0)
+        mask[self.pos < self.global_tokens] = float('inf')
+        mask[self.pos >= current_pos - self.recent_window] = float('inf')
+        mask[self.pos == -1] = 0.0
+        
+        # Apply mask
+        avg_attn = avg_attn.unsqueeze(0).expand_as(self.pos) + mask
         
         # Find the least important token per head
         fill_idx = avg_attn.argmin(dim=-1)
