@@ -81,14 +81,18 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         else:
             current_pos = input_pos
         
+        # self.pos has shape [batch_size, n_heads, max_cache_length]
+        # We need to work with the first batch (index 0)
+        batch_idx = 0
+        
         # For each head, protect global and recent tokens
         for h in range(self.n_heads):
             # Protect global tokens
-            mask[h, self.pos[h] < self.global_tokens] = float('inf')
+            mask[h, self.pos[batch_idx, h] < self.global_tokens] = float('inf')
             # Protect recent tokens  
-            mask[h, self.pos[h] >= current_pos - self.recent_window] = float('inf')
+            mask[h, self.pos[batch_idx, h] >= current_pos - self.recent_window] = float('inf')
             # Mark invalid positions
-            mask[h, self.pos[h] == -1] = -float('inf')
+            mask[h, self.pos[batch_idx, h] == -1] = -float('inf')
         
         # Apply mask to scores
         masked_scores = importance_scores + mask
