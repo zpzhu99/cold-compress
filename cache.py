@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from prompt_compression import get_prompt_compressor_constructor
 from quantization_utils import quantize_tensor, dequantize_tensor
+from cache_ekv_qwen import KVCacheEKVQwen
 
 import argparse
 import torch
@@ -46,6 +47,7 @@ def add_cache_arguments(parser: argparse.ArgumentParser):
         "l2",
         "hybrid",
         "keep_it_odd",
+        "ekv_qwen",
     ]
     debug_strategies = [f"debug_{strategy}" for strategy in strategies]
     strategies.extend(debug_strategies)
@@ -1445,6 +1447,8 @@ def get_cache_constructor(cache_strategy):
     relevant_kwargs = None
     if cache_strategy == "full":
         cls = KVCacheFull
+    elif cache_strategy == "ekv_qwen":
+        cls = KVCacheEKVQwen
     elif cache_strategy == "l2":
         cls = KVCacheL2
     elif cache_strategy == "random":
