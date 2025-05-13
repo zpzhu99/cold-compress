@@ -103,7 +103,9 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
 
     def apply_hadamard_transform(self, x):
         """Apply Hadamard transformation to reduce outliers"""
-        # x shape: [batch, heads, seq_len, head_dim]
+        if x.numel() == 0:  # Handle empty tensors
+            return x
+            
         original_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1])
         
@@ -114,6 +116,9 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
     
     def apply_inverse_hadamard(self, x):
         """Apply inverse Hadamard transformation"""
+        if x.numel() == 0:  # Handle empty tensors
+            return x
+            
         original_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1])
         
@@ -122,64 +127,57 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         
         return x_original.reshape(original_shape)
 
-    def _fill(self, input_pos, k_val, v_val, fill_idxs, **kwargs):
-        """Override to apply Hadamard transformation before storing"""
-        
-        if self.use_quarot:
-            # Apply Hadamard transformation
-            k_transformed = self.apply_hadamard_transform(k_val)
-            v_transformed = self.apply_hadamard_transform(v_val)
+    def quantize_cache(self):
+        """Override to apply Hadamard before quantization"""
+        if self.use_quarot and self.quantize:
+            # Apply Hadamard transformation before quantization
+            k_transformed = self.apply_hadamard_transform(self.k_cache)
+            v_transformed = self.apply_hadamard_transform(self.v_cache)
             
-            # Store transformed values (parent's quantization will handle the rest)
-            super()._fill(input_pos, k_transformed, v_transformed, fill_idxs, **kwargs)
+            # Temporarily store transformed values for quantization
+            original_k = self.k_cache.clone()
+            original_v = self.v_cache.clone()
             
-            # If using dynamic quantization, update the per-token bit allocation
-            if self.use_dynamic_quantization and hasattr(fill_idxs, '__iter__'):
-                for idx in fill_idxs:
-                    bits = self.get_quantization_bits(idx)
-                    # This would need integration with the parent's quantization system
-                    # For now, we rely on the parent's cache_bits setting
+            self.k_cache = k_transformed
+            self.v_cache = v_transformed
+            
+            # Call parent's quantization
+            super().quantize_cache()
+            
+            # Store the scales but keep original values for retrieval
+            self.k_cache_quantized = self.k_cache.clone()
+            self.v_cache_quantized = self.v_cache.clone()
+            
+            # Restore original values
+            self.k_cache = original_k
+            self.v_cache = original_v
         else:
-            # No QuaRot - use standard fill
-            super()._fill(input_pos, k_val, v_val, fill_idxs, **kwargs)
-    
-    def update_kv(self, input_pos, k_val, v_val, is_prefill, **kwargs):
-        """Override to handle Hadamard transformations properly"""
-        # Apply Hadamard before storing
-        if self.use_quarot and not hasattr(self, '_in_retrieval'):
-            k_val_transformed = self.apply_hadamard_transform(k_val)
-            v_val_transformed = self.apply_hadamard_transform(v_val)
-            # Call parent with transformed values
-            return super().update_kv(input_pos, k_val_transformed, v_val_transformed, is_prefill, **kwargs)
-        else:
-            return super().update_kv(input_pos, k_val, v_val, is_prefill, **kwargs)
+            super().quantize_cache()
 
-    def return_kv_cache(self):
-        """Override to apply inverse Hadamard when retrieving from cache"""
-        # Get the raw cache
-        k_cache_raw, v_cache_raw, mask = super().return_kv_cache()
-        
-        if self.use_quarot:
-            # Set flag to prevent re-transformation during retrieval
-            self._in_retrieval = True
+    def dequantize_cache(self):
+        """Override to apply inverse Hadamard after dequantization"""
+        if self.use_quarot and self.quantize:
+            # Get quantized values
+            if hasattr(self, 'k_cache_quantized'):
+                self.k_cache = self.k_cache_quantized
+                self.v_cache = self.v_cache_quantized
             
-            # If cache contains transformed values, inverse transform them
-            if hasattr(self, '_cache_is_transformed') and self._cache_is_transformed:
-                k_cache = self.apply_inverse_hadamard(k_cache_raw)
-                v_cache = self.apply_inverse_hadamard(v_cache_raw)
-            else:
-                k_cache = k_cache_raw
-                v_cache = v_cache_raw
-                
-            self._in_retrieval = False
-            return k_cache, v_cache, mask
-        
-        return k_cache_raw, v_cache_raw, mask
+            # Dequantize
+            super().dequantize_cache()
+            
+            # Apply inverse Hadamard to get back to original space
+            self.k_cache = self.apply_inverse_hadamard(self.k_cache)
+            self.v_cache = self.apply_inverse_hadamard(self.v_cache)
+        else:
+            super().dequantize_cache()
+
+    def _fill(self, input_pos, k_val, v_val, fill_idxs, **kwargs):
+        """Store original values, transform only for quantization"""
+        # Always store original values
+        super()._fill(input_pos, k_val, v_val, fill_idxs, **kwargs)
 
     def _eviction_idx(self, input_pos):
         """Determine which token to evict per head"""
-        # For KVCacheHeadSpecific, we need to return indices per head
-        
         # Calculate importance scores per head
         importance_scores = self.attn_history_num / self.attn_history_denom.clamp(min=1)
         
@@ -218,7 +216,6 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
 
     def update_state(self, input_pos, k, v, is_prefill, attn, **kwargs):
         """Update attention history for importance scoring"""
-        # Use only the attention tensor (attn) from the parameters
         with torch.no_grad():
             if attn is not None:
                 B, H, Q, K = attn.shape
@@ -255,6 +252,12 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
             return self.high_importance_bits
         else:
             return self.low_importance_bits
+
+    def return_kv_cache(self):
+        """Return the KV cache values"""
+        # For QuaRot, we store original values and transform only during quantization
+        # So we can return the cache as-is
+        return super().return_kv_cache()
 
     @property
     def size(self):
