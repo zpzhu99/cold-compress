@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from prompt_compression import get_prompt_compressor_constructor
 from quantization_utils import quantize_tensor, dequantize_tensor
-from cache_ekv_qwen import KVCacheEKVQwen
+# from cache_ekv_qwen import KVCacheEKVQwen
 
 import argparse
 import torch
@@ -1448,6 +1448,7 @@ def get_cache_constructor(cache_strategy):
     if cache_strategy == "full":
         cls = KVCacheFull
     elif cache_strategy == "ekv_qwen":
+        from cache_ekv_qwen import KVCacheEKVQwen
         cls = KVCacheEKVQwen
     elif cache_strategy == "l2":
         cls = KVCacheL2

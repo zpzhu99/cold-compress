@@ -1,6 +1,9 @@
+# cache_ekv_qwen.py
 import torch
 import argparse
-from cache import KVCacheHeadSpecific, get_cache_constructor
+
+# Import only the base class, not the entire cache module
+from cache import KVCacheHeadSpecific
 
 class KVCacheEKVQwen(KVCacheHeadSpecific):
     """
@@ -19,19 +22,22 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         "low_importance_bits",
         "importance_threshold",
         "head_sharing_factor",
+        "history_window_size",
     ]
 
     def __init__(
         self, max_batch_size, n_heads, head_dim, dtype=torch.bfloat16, **kwargs
     ):
         super().__init__(max_batch_size, n_heads, head_dim, dtype, **kwargs)
+        
+        # EKV specific attributes
         self.use_dynamic_quantization = kwargs.get("use_dynamic_quantization", True)
         self.high_importance_bits = kwargs.get("high_importance_bits", 8)
         self.low_importance_bits = kwargs.get("low_importance_bits", 4)
         self.importance_threshold = kwargs.get("importance_threshold", 0.15)
         
         # Qwen has fewer KV heads, so we need to adjust for head sharing
-        self.head_sharing_factor = kwargs.get("head_sharing_factor", 8)  # 32 query heads / 4 KV heads
+        self.head_sharing_factor = kwargs.get("head_sharing_factor", 8)
         
         # Initialize attention history for heavy hitter tracking
         self.attn_history_num = torch.zeros(
@@ -48,8 +54,8 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         )
 
     def _eviction_idx(self, input_pos):
-        # Compute average historical attention (similar to Heavy Hitter)
-        # But adjust for Qwen's fewer KV heads
+        """Determine which token to evict"""
+        # Compute average historical attention
         numerator = self.attn_history_num.sum(dim=-1).float()
         denominator = self.attn_history_denom.clamp(1, self.history_window_size)
         avg_attn = numerator / denominator
@@ -93,27 +99,24 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
                 self.token_importance[:H, :K] = self.attn_history_num[:H, :K]
 
     def get_quantization_bits(self, token_idx):
-        """
-        Dynamic quantization: return bit-width based on token importance
-        Adjusted for Qwen's architecture
-        """
+        """Dynamic quantization based on token importance"""
         if not self.use_dynamic_quantization:
             return self.high_importance_bits
             
-        # Use attention history as importance score
-        # Average across heads for Qwen's fewer KV heads
         importance = self.token_importance[:, token_idx].mean()
-        
-        # Adjust threshold based on head sharing
         adjusted_threshold = self.importance_threshold / self.head_sharing_factor
         
-        # High importance tokens get more bits
         if importance > adjusted_threshold:
             return self.high_importance_bits
         else:
             return self.low_importance_bits
 
-    def insert(self, input_pos, k_val, v_val):
-        """Override insert to handle Qwen-specific optimizations"""
-        # Apply any Qwen-specific transformations here if needed
-        super().insert(input_pos, k_val, v_val)
+    def compress_cache(self, layer_idx=None):
+        """Apply compression based on importance scores"""
+        # This method can be extended to implement layer-specific compression
+        pass
+
+    @property
+    def size(self):
+        """Return the effective size of the cache"""
+        return (self.pos >= 0).sum(dim=1).max().item()
