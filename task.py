@@ -174,7 +174,7 @@ class Squality(EvaluationTask):
         self.metrics = {
             "BertScore": AutoMetric.from_name("bertscore"),
             "Rouge": AutoMetric.from_name("rouge"),
-            "LLM-Rouge": AutoMetric.from_name("llm-rouge"),
+            # "LLM-Rouge": AutoMetric.from_name("llm-rouge"),
         }
 
     def prepare_row(self, row: dict):
