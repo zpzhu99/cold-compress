@@ -3,7 +3,7 @@ prompt_compression_strategy: ["heavy_hitter"]
 global_tokens: 4
 recent_window: 16
 use_dynamic_quantization: true
-use_quarot: true  # Enable QuaRot
+use_quarot: false  # Enable QuaRot
 high_importance_bits: 8
 low_importance_bits: 4
 history_window_size: 1024
