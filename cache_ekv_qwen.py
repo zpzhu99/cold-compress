@@ -93,29 +93,31 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         fill_idx = avg_attn.argmin(dim=-1)
         return fill_idx
 
-    def update_state(self, attention, **kwargs):
+    def update_state(self, input_pos, k, v, is_prefill, attn, **kwargs):
         """Update attention history for importance scoring"""
+        # Use only the attention tensor (attn) from the parameters
         with torch.no_grad():
-            B, H, Q, K = attention.shape
-            
-            # Handle different input dimensions
-            if B == 1 and Q == 1:
-                # Update attention history
-                valid_k = min(K, self.max_cache_length)
-                valid_h = min(H, self.n_heads)
+            if attn is not None:
+                B, H, Q, K = attn.shape
                 
-                self.attn_history_num[:valid_h, :valid_k] = (
-                    self.attn_history_num[:valid_h, :valid_k] * self.history_window_size + 
-                    attention[0, :valid_h, 0, :valid_k]
-                ) / (self.history_window_size + 1)
-                
-                self.attn_history_denom[:valid_h, :valid_k] = torch.clamp(
-                    self.attn_history_denom[:valid_h, :valid_k] + 1, 
-                    max=self.history_window_size
-                )
-                
-                # Update token importance scores
-                self.token_importance[:valid_h, :valid_k] = self.attn_history_num[:valid_h, :valid_k]
+                # Handle different input dimensions
+                if B == 1 and Q == 1:
+                    # Update attention history
+                    valid_k = min(K, self.max_cache_length)
+                    valid_h = min(H, self.n_heads)
+                    
+                    self.attn_history_num[:valid_h, :valid_k] = (
+                        self.attn_history_num[:valid_h, :valid_k] * self.history_window_size + 
+                        attn[0, :valid_h, 0, :valid_k]
+                    ) / (self.history_window_size + 1)
+                    
+                    self.attn_history_denom[:valid_h, :valid_k] = torch.clamp(
+                        self.attn_history_denom[:valid_h, :valid_k] + 1, 
+                        max=self.history_window_size
+                    )
+                    
+                    # Update token importance scores
+                    self.token_importance[:valid_h, :valid_k] = self.attn_history_num[:valid_h, :valid_k]
 
     def get_quantization_bits(self, token_idx):
         """Dynamic quantization based on token importance"""
