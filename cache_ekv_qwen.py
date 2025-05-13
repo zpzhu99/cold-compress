@@ -63,39 +63,35 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         self.cache_bits = kwargs.get("cache_bits", None)
 
     def _eviction_idx(self, input_pos):
-        """Determine which token to evict - properly handle tensor types"""
+        """Determine which token to evict"""
         # Ensure input_pos is a scalar for comparisons
         if torch.is_tensor(input_pos):
             current_pos = input_pos.item() if input_pos.numel() == 1 else input_pos.max().item()
         else:
             current_pos = input_pos
-            
-        # Compute average historical attention per head
-        numerator = self.attn_history_num.mean(dim=1).float()  # Average across cache positions
-        denominator = self.attn_history_denom.mean(dim=1).clamp(1, self.history_window_size)
-        avg_attn = numerator / denominator
         
-        # Apply head sharing factor to account for Qwen's architecture
-        avg_attn = avg_attn * self.head_sharing_factor
+        # Initialize scores for all positions
+        scores = torch.zeros(self.max_cache_length, device="cuda")
         
-        # For each head, find least important position
-        importance_scores = torch.zeros((self.n_heads, self.max_cache_length), device="cuda")
+        # Calculate importance scores based on attention history
+        # Average across all heads since we need a single eviction index
+        avg_attention = self.attn_history_num.mean(dim=0)
+        avg_denom = self.attn_history_denom.mean(dim=0).clamp(min=1)
+        scores = avg_attention / avg_denom
         
-        for h in range(self.n_heads):
-            # Use attention history for this head
-            head_scores = self.attn_history_num[h] / self.attn_history_denom[h].clamp(1)
-            
-            # Protect global and recent tokens
-            head_scores[self.pos[h] < self.global_tokens] = float('inf')
-            head_scores[self.pos[h] >= current_pos - self.recent_window] = float('inf')
-            head_scores[self.pos[h] == -1] = -1
-            
-            importance_scores[h] = head_scores
+        # Protect global tokens
+        scores[self.pos < self.global_tokens] = float('inf')
         
-        # Get minimum per head
-        fill_idx = importance_scores.argmin(dim=1)
+        # Protect recent tokens
+        scores[self.pos >= current_pos - self.recent_window] = float('inf')
         
-        # Return as 1D tensor
+        # Invalid positions
+        scores[self.pos == -1] = -1
+        
+        # Find the position with lowest score (least important)
+        fill_idx = scores.argmin()
+        
+        # Return as 0D tensor
         return fill_idx
 
     def update_state(self, input_pos, k, v, is_prefill, attn, **kwargs):
