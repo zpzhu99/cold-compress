@@ -64,35 +64,39 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
 
     def _eviction_idx(self, input_pos):
         """Determine which token to evict"""
-        # Ensure input_pos is a scalar for comparisons
+        # Check parent class implementation - it expects a single index
+        # For head-specific caches, we need to return per-head indices
+        
+        # Calculate average attention scores across positions
+        avg_scores = self.attn_history_num / self.attn_history_denom.clamp(min=1)
+        
+        # Apply head sharing factor
+        avg_scores = avg_scores * self.head_sharing_factor
+        
+        # Mask to protect certain positions
+        # Note: self.pos has shape [n_heads, max_cache_length]
+        mask = torch.zeros_like(avg_scores)
+        
+        # Protect global tokens
+        mask[self.pos < self.global_tokens] = float('inf')
+        
+        # Protect recent tokens
         if torch.is_tensor(input_pos):
             current_pos = input_pos.item() if input_pos.numel() == 1 else input_pos.max().item()
         else:
             current_pos = input_pos
-        
-        # Initialize scores for all positions
-        scores = torch.zeros(self.max_cache_length, device="cuda")
-        
-        # Calculate importance scores based on attention history
-        # Average across all heads since we need a single eviction index
-        avg_attention = self.attn_history_num.mean(dim=0)
-        avg_denom = self.attn_history_denom.mean(dim=0).clamp(min=1)
-        scores = avg_attention / avg_denom
-        
-        # Protect global tokens
-        scores[self.pos < self.global_tokens] = float('inf')
-        
-        # Protect recent tokens
-        scores[self.pos >= current_pos - self.recent_window] = float('inf')
+        mask[self.pos >= current_pos - self.recent_window] = float('inf')
         
         # Invalid positions
-        scores[self.pos == -1] = -1
+        mask[self.pos == -1] = -float('inf')
         
-        # Find the position with lowest score (least important)
-        fill_idx = scores.argmin()
+        # Apply mask
+        scores_with_mask = avg_scores + mask
         
-        # Return as 0D tensor
-        return fill_idx
+        # Get minimum per head
+        eviction_indices = scores_with_mask.argmin(dim=1)
+        
+        return eviction_indices
 
     def update_state(self, input_pos, k, v, is_prefill, attn, **kwargs):
         """Update attention history for importance scoring"""
