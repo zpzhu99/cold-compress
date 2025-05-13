@@ -7,4 +7,5 @@ high_importance_bits: 8
 low_importance_bits: 4
 history_window_size: 1024
 importance_threshold: 0.15
-head_sharing_factor: 8  # Qwen has 32 query heads / 4 KV heads
+head_sharing_factor: 8
+cache_bits: null  # Set to 4 or 8 to use fixed-bit quantization
