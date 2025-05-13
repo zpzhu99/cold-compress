@@ -63,38 +63,38 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         self.cache_bits = kwargs.get("cache_bits", None)
 
     def _eviction_idx(self, input_pos):
-        """Determine which token to evict"""
-        # Check parent class implementation - it expects a single index
-        # For head-specific caches, we need to return per-head indices
+        """Determine which token to evict per head"""
+        # For KVCacheHeadSpecific, we need to return indices per head
         
-        # Calculate average attention scores across positions
-        avg_scores = self.attn_history_num / self.attn_history_denom.clamp(min=1)
+        # Calculate importance scores per head
+        importance_scores = self.attn_history_num / self.attn_history_denom.clamp(min=1)
         
         # Apply head sharing factor
-        avg_scores = avg_scores * self.head_sharing_factor
+        importance_scores = importance_scores * self.head_sharing_factor
         
-        # Mask to protect certain positions
-        # Note: self.pos has shape [n_heads, max_cache_length]
-        mask = torch.zeros_like(avg_scores)
+        # Create a mask to protect certain positions
+        mask = torch.zeros_like(importance_scores)
         
-        # Protect global tokens
-        mask[self.pos < self.global_tokens] = float('inf')
-        
-        # Protect recent tokens
+        # Get current position
         if torch.is_tensor(input_pos):
             current_pos = input_pos.item() if input_pos.numel() == 1 else input_pos.max().item()
         else:
             current_pos = input_pos
-        mask[self.pos >= current_pos - self.recent_window] = float('inf')
         
-        # Invalid positions
-        mask[self.pos == -1] = -float('inf')
+        # For each head, protect global and recent tokens
+        for h in range(self.n_heads):
+            # Protect global tokens
+            mask[h, self.pos[h] < self.global_tokens] = float('inf')
+            # Protect recent tokens  
+            mask[h, self.pos[h] >= current_pos - self.recent_window] = float('inf')
+            # Mark invalid positions
+            mask[h, self.pos[h] == -1] = -float('inf')
         
-        # Apply mask
-        scores_with_mask = avg_scores + mask
+        # Apply mask to scores
+        masked_scores = importance_scores + mask
         
-        # Get minimum per head
-        eviction_indices = scores_with_mask.argmin(dim=1)
+        # Find minimum score position for each head
+        eviction_indices = masked_scores.argmin(dim=1)
         
         return eviction_indices
 
