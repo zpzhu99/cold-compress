@@ -93,7 +93,7 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         fill_idx = avg_attn.argmin(dim=-1)
         return fill_idx
 
-    def update_state(self, attention):
+    def update_state(self, attention, **kwargs):
         """Update attention history for importance scoring"""
         with torch.no_grad():
             B, H, Q, K = attention.shape
