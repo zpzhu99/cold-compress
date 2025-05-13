@@ -218,7 +218,7 @@ class TriviaQA(EvaluationTask):
         self.metrics = {
             "BertScore": AutoMetric.from_name("bertscore"),
             "Rouge": AutoMetric.from_name("rouge"),
-            "LLM-Rouge": AutoMetric.from_name("llm-rouge"),
+            # "LLM-Rouge": AutoMetric.from_name("llm-rouge"),
         }
 
     def prepare_row(self, row: dict):
@@ -288,7 +288,7 @@ IMPORTANT:
         self.metrics = {
             "BertScore": AutoMetric.from_name("bertscore"),
             "Rouge": AutoMetric.from_name("rouge"),
-            "LLM-Rouge": AutoMetric.from_name("llm-rouge"),
+            # "LLM-Rouge": AutoMetric.from_name("llm-rouge"),
         }
 
     def prepare_row(self, row: dict):
@@ -337,7 +337,7 @@ class QMSum(EvaluationTask):
         self.metrics = {
             "BertScore": AutoMetric.from_name("bertscore"),
             "Rouge": AutoMetric.from_name("rouge"),
-            "LLM-Rouge": AutoMetric.from_name("llm-rouge"),
+            # "LLM-Rouge": AutoMetric.from_name("llm-rouge"),
         }
 
     def prepare_row(self, row: dict):
@@ -379,7 +379,7 @@ IMPORTANT: You should only use the infomation provided in the paragraphs to answ
         self.metrics = {
             "BertScore": AutoMetric.from_name("bertscore"),
             "Rouge": AutoMetric.from_name("rouge"),
-            "LLM-Rouge": AutoMetric.from_name("llm-rouge"),
+            # "LLM-Rouge": AutoMetric.from_name("llm-rouge"),
         }
 
     def prepare_row(self, row: dict):
