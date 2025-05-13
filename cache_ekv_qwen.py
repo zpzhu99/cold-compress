@@ -70,27 +70,32 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         else:
             current_pos = input_pos
             
-        # Compute average historical attention
-        numerator = self.attn_history_num.sum(dim=0).float()
-        denominator = self.attn_history_denom.sum(dim=0).clamp(1, self.history_window_size)
+        # Compute average historical attention per head
+        numerator = self.attn_history_num.mean(dim=1).float()  # Average across cache positions
+        denominator = self.attn_history_denom.mean(dim=1).clamp(1, self.history_window_size)
         avg_attn = numerator / denominator
         
         # Apply head sharing factor to account for Qwen's architecture
         avg_attn = avg_attn * self.head_sharing_factor
         
-        # Create a float mask for all heads
-        mask = torch.zeros_like(self.pos, dtype=torch.float32)
+        # For each head, find least important position
+        importance_scores = torch.zeros((self.n_heads, self.max_cache_length), device="cuda")
         
-        # Protect global and recent tokens
-        mask[self.pos < self.global_tokens] = float('inf')
-        mask[self.pos >= current_pos - self.recent_window] = float('inf')
-        mask[self.pos == -1] = 0.0
+        for h in range(self.n_heads):
+            # Use attention history for this head
+            head_scores = self.attn_history_num[h] / self.attn_history_denom[h].clamp(1)
+            
+            # Protect global and recent tokens
+            head_scores[self.pos[h] < self.global_tokens] = float('inf')
+            head_scores[self.pos[h] >= current_pos - self.recent_window] = float('inf')
+            head_scores[self.pos[h] == -1] = -1
+            
+            importance_scores[h] = head_scores
         
-        # Apply mask
-        avg_attn = avg_attn.unsqueeze(0).expand_as(mask) + mask
+        # Get minimum per head
+        fill_idx = importance_scores.argmin(dim=1)
         
-        # Find the least important token per head
-        fill_idx = avg_attn.argmin(dim=-1)
+        # Return as 1D tensor
         return fill_idx
 
     def update_state(self, input_pos, k, v, is_prefill, attn, **kwargs):
