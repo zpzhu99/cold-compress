@@ -4,28 +4,25 @@ import math
 import argparse
 from cache import KVCacheHeadSpecific
 
-def create_hadamard_matrix(n, device='cuda'):
+def create_hadamard_matrix(n, device='cuda', dtype=torch.float32):
     """Create a Hadamard matrix of size n x n"""
-    # Ensure n is a power of 2
-    if n & (n - 1) != 0:
-        # Round to next power of 2
-        n = 2 ** math.ceil(math.log2(n))
-    
-    # Recursive definition of Hadamard matrix
     if n == 1:
-        return torch.tensor([[1.0]], device=device)
-    elif n == 2:
-        return torch.tensor([[1.0, 1.0], [1.0, -1.0]], device=device) / math.sqrt(2)
+        return torch.tensor([[1.0]], device=device, dtype=dtype)
     
-    # Use Sylvester's construction
-    H_half = create_hadamard_matrix(n // 2, device)
-    H = torch.zeros(n, n, device=device)
-    H[:n//2, :n//2] = H_half
-    H[:n//2, n//2:] = H_half
-    H[n//2:, :n//2] = H_half
-    H[n//2:, n//2:] = -H_half
+    # Ensure n is a power of 2
+    n_pow2 = 2 ** math.ceil(math.log2(n))
     
-    return H / math.sqrt(2)
+    # Recursive construction
+    H_half = create_hadamard_matrix(n_pow2 // 2, device, dtype)
+    H = torch.zeros(n_pow2, n_pow2, device=device, dtype=dtype)
+    H[:n_pow2//2, :n_pow2//2] = H_half
+    H[:n_pow2//2, n_pow2//2:] = H_half
+    H[n_pow2//2:, :n_pow2//2] = H_half
+    H[n_pow2//2:, n_pow2//2:] = -H_half
+    
+    # Normalize and return only the needed size
+    H = H[:n, :n] / math.sqrt(n)
+    return H
 
 def create_randomized_hadamard(n, device='cuda'):
     """Create a randomized Hadamard matrix as in QuaRot"""
@@ -99,26 +96,20 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         self.cache_bits = kwargs.get("cache_bits", None)
         
         # QuaRot specific initialization
-        self.use_quarot = kwargs.get("use_quarot", True)
+        self.use_quarot = kwargs.get("use_quarot", False)
         if self.use_quarot:
-            # Create Hadamard matrices for keys and values
-            # Ensure head_dim is power of 2 or pad
-            hadamard_dim = 2 ** math.ceil(math.log2(head_dim))
-            self.hadamard_dim = hadamard_dim
-            self.head_dim = head_dim
+            # Create Hadamard matrices with the same dtype as the cache
+            self.H = create_hadamard_matrix(head_dim, device="cuda").to(dtype)
+            # For randomization (as in QuaRot paper)
+            self.D = torch.diag(torch.randint(0, 2, (head_dim,), device="cuda") * 2 - 1).float().to(dtype)
+            self.HD = torch.matmul(self.H, self.D)
+            self.HD_inv = self.HD.t()  # Inverse is transpose for orthogonal matrix
             
-            self.H = create_randomized_hadamard(hadamard_dim, device="cuda")
-            # For orthogonal matrices, inverse is transpose
-            self.H_inv = self.H.t()
-            
-            # Pre-quantization clipping ratio (from QuaRot paper)
             self.clipping_ratio = kwargs.get("clipping_ratio", 0.9)
             
-            # Store quantization scales per head and position
-            self.k_scales = torch.ones((max_batch_size, n_heads, self.max_cache_length), 
-                                     device="cuda", dtype=torch.float32)
-            self.v_scales = torch.ones((max_batch_size, n_heads, self.max_cache_length), 
-                                     device="cuda", dtype=torch.float32)
+            # Storage for quantization scales with the same dtype
+            self.register_buffer("k_quarot_scales", torch.ones((max_batch_size, n_heads, self.max_cache_length), dtype=dtype))
+            self.register_buffer("v_quarot_scales", torch.ones((max_batch_size, n_heads, self.max_cache_length), dtype=dtype))
 
     def apply_hadamard_transform(self, x):
         """Apply Hadamard transformation to reduce outliers"""
