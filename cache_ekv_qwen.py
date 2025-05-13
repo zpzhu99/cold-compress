@@ -1,7 +1,41 @@
 # cache_ekv_qwen.py
 import torch
+import math
 import argparse
 from cache import KVCacheHeadSpecific
+
+def create_hadamard_matrix(n, device='cuda'):
+    """Create a Hadamard matrix of size n x n"""
+    # Ensure n is a power of 2
+    if n & (n - 1) != 0:
+        # Round to next power of 2
+        n = 2 ** math.ceil(math.log2(n))
+    
+    # Recursive definition of Hadamard matrix
+    if n == 1:
+        return torch.tensor([[1.0]], device=device)
+    elif n == 2:
+        return torch.tensor([[1.0, 1.0], [1.0, -1.0]], device=device) / math.sqrt(2)
+    
+    # Use Sylvester's construction
+    H_half = create_hadamard_matrix(n // 2, device)
+    H = torch.zeros(n, n, device=device)
+    H[:n//2, :n//2] = H_half
+    H[:n//2, n//2:] = H_half
+    H[n//2:, :n//2] = H_half
+    H[n//2:, n//2:] = -H_half
+    
+    return H / math.sqrt(2)
+
+def create_randomized_hadamard(n, device='cuda'):
+    """Create a randomized Hadamard matrix as in QuaRot"""
+    H = create_hadamard_matrix(n, device)
+    
+    # Random diagonal matrix for randomization
+    D = torch.diag((torch.randint(0, 2, (n,), device=device).float() * 2 - 1))
+    
+    # Randomized Hadamard: D * H * D
+    return torch.matmul(torch.matmul(D, H), D)
 
 class KVCacheEKVQwen(KVCacheHeadSpecific):
     """
@@ -21,7 +55,9 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         "importance_threshold",
         "head_sharing_factor",
         "history_window_size",
-        "cache_bits",  # Add this to inherited kwargs
+        "cache_bits",
+        "use_quarot",
+        "clipping_ratio",
     ]
 
     def __init__(
@@ -61,6 +97,202 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
         
         # Store the cache bits for potential use
         self.cache_bits = kwargs.get("cache_bits", None)
+        
+        # QuaRot specific initialization
+        self.use_quarot = kwargs.get("use_quarot", True)
+        if self.use_quarot:
+            # Create Hadamard matrices for keys and values
+            # Ensure head_dim is power of 2 or pad
+            hadamard_dim = 2 ** math.ceil(math.log2(head_dim))
+            self.hadamard_dim = hadamard_dim
+            self.head_dim = head_dim
+            
+            self.H = create_randomized_hadamard(hadamard_dim, device="cuda")
+            # For orthogonal matrices, inverse is transpose
+            self.H_inv = self.H.t()
+            
+            # Pre-quantization clipping ratio (from QuaRot paper)
+            self.clipping_ratio = kwargs.get("clipping_ratio", 0.9)
+            
+            # Store quantization scales per head and position
+            self.k_scales = torch.ones((max_batch_size, n_heads, self.max_cache_length), 
+                                     device="cuda", dtype=torch.float32)
+            self.v_scales = torch.ones((max_batch_size, n_heads, self.max_cache_length), 
+                                     device="cuda", dtype=torch.float32)
+
+    def apply_hadamard_transform(self, x):
+        """Apply Hadamard transformation to reduce outliers"""
+        # x shape: [batch, heads, seq_len, head_dim]
+        batch, heads, seq_len, dim = x.shape
+        
+        # Pad if necessary
+        if dim < self.hadamard_dim:
+            padding = self.hadamard_dim - dim
+            x_padded = torch.nn.functional.pad(x, (0, padding))
+        else:
+            x_padded = x
+        
+        # Reshape for matrix multiplication
+        x_flat = x_padded.reshape(-1, self.hadamard_dim)
+        
+        # Apply transformation
+        x_transformed = torch.matmul(x_flat, self.H)
+        
+        # Reshape back and remove padding
+        x_transformed = x_transformed.reshape(batch, heads, seq_len, self.hadamard_dim)
+        if dim < self.hadamard_dim:
+            x_transformed = x_transformed[:, :, :, :dim]
+        
+        return x_transformed
+    
+    def apply_inverse_hadamard(self, x):
+        """Apply inverse Hadamard transformation during retrieval"""
+        batch, heads, seq_len, dim = x.shape
+        
+        # Pad if necessary
+        if dim < self.hadamard_dim:
+            padding = self.hadamard_dim - dim
+            x_padded = torch.nn.functional.pad(x, (0, padding))
+        else:
+            x_padded = x
+        
+        # Reshape for matrix multiplication
+        x_flat = x_padded.reshape(-1, self.hadamard_dim)
+        
+        # Apply inverse transformation
+        x_original = torch.matmul(x_flat, self.H_inv)
+        
+        # Reshape back and remove padding
+        x_original = x_original.reshape(batch, heads, seq_len, self.hadamard_dim)
+        if dim < self.hadamard_dim:
+            x_original = x_original[:, :, :, :dim]
+        
+        return x_original
+    
+    def quantize_with_quarot(self, tensor, n_bits=4):
+        """Quantize tensor using QuaRot approach with per-token quantization"""
+        # tensor shape: [batch, heads, seq_len, head_dim]
+        
+        # Compute scale per token (across head_dim)
+        max_vals = torch.quantile(tensor.abs().view(-1, tensor.shape[-1]), 
+                                self.clipping_ratio, dim=-1, keepdim=True)
+        max_vals = max_vals.view(tensor.shape[:-1] + (1,))
+        
+        # Compute scale
+        scale = max_vals / (2**(n_bits-1) - 1)
+        scale = scale.squeeze(-1)  # Remove last dimension for storage
+        
+        # Quantize
+        quantized = torch.clamp(tensor / max_vals, -1.0, 1.0)
+        quantized = (quantized * (2**(n_bits-1) - 1)).round()
+        
+        # Store as appropriate integer type
+        if n_bits <= 8:
+            quantized = quantized.to(torch.int8)
+        else:
+            quantized = quantized.to(torch.int16)
+        
+        return quantized, scale
+    
+    def dequantize_with_quarot(self, quantized, scale, n_bits=4):
+        """Dequantize tensor"""
+        # Reshape scale to match quantized dimensions
+        scale = scale.unsqueeze(-1)
+        
+        # Dequantize
+        dequantized = quantized.float() / (2**(n_bits-1) - 1)
+        dequantized = dequantized * scale
+        
+        return dequantized
+    
+    def _fill(self, input_pos, k_val, v_val, fill_idxs, **kwargs):
+        """Override to apply Hadamard transformation before storing"""
+        
+        if self.use_quarot:
+            # Apply Hadamard transformation to reduce outliers
+            k_transformed = self.apply_hadamard_transform(k_val)
+            v_transformed = self.apply_hadamard_transform(v_val)
+            
+            # Determine quantization bits based on importance
+            batch_idx = 0
+            bits_per_position = []
+            
+            for idx in range(k_val.shape[2]):  # seq_len
+                bits = self.get_quantization_bits(idx)
+                bits_per_position.append(bits)
+            
+            # Quantize each position with appropriate bits
+            k_quantized_list = []
+            v_quantized_list = []
+            k_scales_list = []
+            v_scales_list = []
+            
+            for idx, bits in enumerate(bits_per_position):
+                k_slice = k_transformed[:, :, idx:idx+1, :]
+                v_slice = v_transformed[:, :, idx:idx+1, :]
+                
+                k_q, k_s = self.quantize_with_quarot(k_slice, bits)
+                v_q, v_s = self.quantize_with_quarot(v_slice, bits)
+                
+                k_quantized_list.append(k_q)
+                v_quantized_list.append(v_q)
+                k_scales_list.append(k_s)
+                v_scales_list.append(v_s)
+            
+            # Concatenate results
+            k_quantized = torch.cat(k_quantized_list, dim=2)
+            v_quantized = torch.cat(v_quantized_list, dim=2)
+            
+            # Store scales
+            if isinstance(fill_idxs, torch.Tensor):
+                for i, idx in enumerate(fill_idxs):
+                    self.k_scales[:, :, idx] = k_scales_list[i].squeeze(2)
+                    self.v_scales[:, :, idx] = v_scales_list[i].squeeze(2)
+            else:
+                self.k_scales[:, :, fill_idxs] = torch.stack(k_scales_list, dim=2).squeeze(3)
+                self.v_scales[:, :, fill_idxs] = torch.stack(v_scales_list, dim=2).squeeze(3)
+            
+            # Store quantized values
+            super()._fill(input_pos, k_quantized, v_quantized, fill_idxs, **kwargs)
+        else:
+            # No QuaRot - use standard fill
+            super()._fill(input_pos, k_val, v_val, fill_idxs, **kwargs)
+    
+    def return_kv_cache(self):
+        """Override to apply inverse Hadamard when retrieving from cache"""
+        k_cache, v_cache, mask = super().return_kv_cache()
+        
+        if self.use_quarot and self.k_cache.dtype in [torch.int8, torch.int16]:
+            # Dequantize each position with its stored scale and bits
+            k_dequantized = []
+            v_dequantized = []
+            
+            for idx in range(self.max_cache_length):
+                # Get bits used for this position (simplified - could store this)
+                bits = self.get_quantization_bits(idx)
+                
+                # Dequantize
+                k_slice = k_cache[:, :, idx:idx+1, :]
+                v_slice = v_cache[:, :, idx:idx+1, :]
+                k_scale = self.k_scales[:, :, idx:idx+1]
+                v_scale = self.v_scales[:, :, idx:idx+1]
+                
+                k_deq = self.dequantize_with_quarot(k_slice, k_scale, bits)
+                v_deq = self.dequantize_with_quarot(v_slice, v_scale, bits)
+                
+                k_dequantized.append(k_deq)
+                v_dequantized.append(v_deq)
+            
+            k_dequantized = torch.cat(k_dequantized, dim=2)
+            v_dequantized = torch.cat(v_dequantized, dim=2)
+            
+            # Apply inverse Hadamard to restore original space
+            k_original = self.apply_inverse_hadamard(k_dequantized)
+            v_original = self.apply_inverse_hadamard(v_dequantized)
+            
+            return k_original, v_original, mask
+        
+        return k_cache, v_cache, mask
 
     def _eviction_idx(self, input_pos):
         """Determine which token to evict per head"""
