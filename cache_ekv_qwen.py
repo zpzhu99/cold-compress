@@ -143,20 +143,38 @@ class KVCacheEKVQwen(KVCacheHeadSpecific):
             # No QuaRot - use standard fill
             super()._fill(input_pos, k_val, v_val, fill_idxs, **kwargs)
     
+    def update_kv(self, input_pos, k_val, v_val, is_prefill, **kwargs):
+        """Override to handle Hadamard transformations properly"""
+        # Apply Hadamard before storing
+        if self.use_quarot and not hasattr(self, '_in_retrieval'):
+            k_val_transformed = self.apply_hadamard_transform(k_val)
+            v_val_transformed = self.apply_hadamard_transform(v_val)
+            # Call parent with transformed values
+            return super().update_kv(input_pos, k_val_transformed, v_val_transformed, is_prefill, **kwargs)
+        else:
+            return super().update_kv(input_pos, k_val, v_val, is_prefill, **kwargs)
+
     def return_kv_cache(self):
         """Override to apply inverse Hadamard when retrieving from cache"""
-        k_cache, v_cache, mask = super().return_kv_cache()
+        # Get the raw cache
+        k_cache_raw, v_cache_raw, mask = super().return_kv_cache()
         
-        if self.use_quarot and not self.quantize:
-            # If not quantized, apply inverse transform directly
-            k_original = self.apply_inverse_hadamard(k_cache)
-            v_original = self.apply_inverse_hadamard(v_cache)
-            return k_original, v_original, mask
+        if self.use_quarot:
+            # Set flag to prevent re-transformation during retrieval
+            self._in_retrieval = True
+            
+            # If cache contains transformed values, inverse transform them
+            if hasattr(self, '_cache_is_transformed') and self._cache_is_transformed:
+                k_cache = self.apply_inverse_hadamard(k_cache_raw)
+                v_cache = self.apply_inverse_hadamard(v_cache_raw)
+            else:
+                k_cache = k_cache_raw
+                v_cache = v_cache_raw
+                
+            self._in_retrieval = False
+            return k_cache, v_cache, mask
         
-        # If quantized, the parent class handles dequantization
-        # We would apply inverse Hadamard after dequantization
-        # This would require modifying the parent's dequantize_cache method
-        return k_cache, v_cache, mask
+        return k_cache_raw, v_cache_raw, mask
 
     def _eviction_idx(self, input_pos):
         """Determine which token to evict per head"""
